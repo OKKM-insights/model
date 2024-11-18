@@ -1,6 +1,6 @@
-# Object Detector: README
+# AI - Object Detector
 
-This README provides a comprehensive guide for setting up, training, and running the PlanesNet Detection System. Follow these steps carefully to ensure successful execution.
+This README provides a comprehensive guide for setting up, training, and running the Object Detection System. Follow these steps carefully to ensure successful execution.
 
 ---
 
