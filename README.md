@@ -1,4 +1,4 @@
-# PlanesNet Detection System: README
+# Object Detector: README
 
 This README provides a comprehensive guide for setting up, training, and running the PlanesNet Detection System. Follow these steps carefully to ensure successful execution.
 
