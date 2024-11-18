@@ -9,7 +9,7 @@ This README provides a comprehensive guide for setting up, training, and running
 Ensure that your Python version is compatible with the TensorFlow version required for this project. TensorFlow compatibility is a common issue; please verify and fix mismatches as necessary.
 
 ### Recommended Environment:
-- **Python Version**: 3.x (preferably 3.8 or later)
+- **Python Version**: 3.x (preferably 3.8 or later) Don't go above 3.11. Fails for that.
 - **TensorFlow Version**: Check `requirements.txt` for the specific version.
 
 > *Tip*: Using a virtual environment is highly recommended to avoid conflicts with global Python packages.
