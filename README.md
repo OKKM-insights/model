@@ -4,21 +4,6 @@ This README provides a comprehensive guide for setting up, training, and running
 
 ---
 
-## Table of Contents
-1. [System Requirements](#system-requirements)
-2. [Setup Instructions](#setup-instructions)
-3. [Required Files](#required-files)
-4. [Dataset Information](#dataset-information)
-5. [Step-by-Step Usage](#step-by-step-usage)
-    - [Training the Model](#training-the-model)
-    - [Running the CNN Model Script](#running-the-cnn-model-script)
-    - [Executing the Locator Script](#executing-the-locator-script)
-6. [Output Location](#output-location)
-7. [Troubleshooting](#troubleshooting)
-8. [Contact Information](#contact-information)
-
----
-
 ## System Requirements
 
 Ensure that your Python version is compatible with the TensorFlow version required for this project. TensorFlow compatibility is a common issue; please verify and fix mismatches as necessary.
