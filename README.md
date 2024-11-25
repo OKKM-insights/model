@@ -9,7 +9,7 @@ This README provides a comprehensive guide for setting up, training, and running
 Ensure that your Python version is compatible with the TensorFlow version required for this project. TensorFlow compatibility is a common issue; please verify and fix mismatches as necessary.
 
 ### Recommended Environment:
-- **Python Version**: 3.x (preferably 3.8 or later) Don't go above 3.11. Fails for that.
+- **Python Version**: 3.x (preferably 3.10.11) Don't go above 3.11. Fails for that.
 - **TensorFlow Version**: Check `requirements.txt` for the specific version.
 
 > *Tip*: Using a virtual environment is highly recommended to avoid conflicts with global Python packages.
@@ -67,7 +67,7 @@ The latest version of `planesnet.json` is available through the [PlanesNet Kaggl
 Run the `train.py` script to train the model using `planesnet.json`. This will generate a `.tfl` model file in the `AI_Models/` directory.
 
 ```bash
-python train.py "planesnet.json" "AI_Models/model.tfl"
+python train.py "planesnet.json" "model.tfl"
 ```
 
 ### 2. **Running the CNN Model Script**
@@ -83,7 +83,7 @@ To detect planes in landscape images, run the `locator.py` script. Pass the trai
 Example command:
 
 ```bash
-python locator.py "AI_Models/model.tfl" "Landscape_Views/landscape_A.png"
+python locator.py "model.tfl" "Landscape_Views/landscape_A.png"
 ```
 
 ---
