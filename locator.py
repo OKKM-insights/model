@@ -63,22 +63,27 @@ def preprocess_image(in_fname):
     print(f"Image loaded with shape {arr.shape}.")
     return arr
 
-def sliding_window_detection(arr, step=10, win=20):
+def sliding_window_detection(arr, step=10, win=20, confidence_threshold=0.5):
     """Perform sliding window detection on the image array.
     
     Args:
         arr: Input image array
         step: Step size for sliding window (default: 10 pixels)
         win: Window size (default: 20 pixels)
+        confidence_threshold: Threshold for considering a detection (default: 0.5)
     """
     print("Initializing sliding window detection...")
     shape = arr.shape
     detections = np.zeros((shape[0], shape[1]), dtype='float32')
     confidences = np.zeros((shape[0], shape[1]), dtype='float32')
+    
+    max_confidence = 0
+    max_confidence_loc = None
 
     # Loop through pixel positions
     for i in range(0, shape[0] - win, step):
-        print(f"Processing row {i} of {shape[0] - win}...")
+        if i % 50 == 0:  # Print progress less frequently
+            print(f"Processing row {i} of {shape[0] - win}...")
         for j in range(0, shape[1] - win, step):
             # Extract sub-chip
             chip = arr[i:i+win, j:j+win, :]
@@ -87,11 +92,22 @@ def sliding_window_detection(arr, step=10, win=20):
             prediction = model.predict([chip / 255.])[0]
             confidence = prediction[1]  # Probability of being an airplane
             
+            # Track maximum confidence
+            if confidence > max_confidence:
+                max_confidence = confidence
+                max_confidence_loc = (i, j)
+            
             # Record detections and confidences
-            detections[i + int(win / 2), j + int(win / 2)] = 1 if confidence > 0.5 else 0
+            detections[i + int(win / 2), j + int(win / 2)] = 1 if confidence > confidence_threshold else 0
             confidences[i + int(win / 2), j + int(win / 2)] = confidence
 
-    print("Sliding window detection completed.")
+    print(f"\nSliding window detection completed.")
+    print(f"Maximum confidence: {max_confidence:.3f}")
+    if max_confidence_loc:
+        print(f"Location of maximum confidence: row={max_confidence_loc[0]}, col={max_confidence_loc[1]}")
+    print(f"Number of detections above {confidence_threshold} threshold: {np.sum(detections)}")
+    print(f"Average confidence across all windows: {np.mean(confidences):.3f}")
+    
     return detections, confidences
 
 def draw_bounding_boxes(output, detections, confidences, win, confidence_threshold=0.5):
@@ -154,16 +170,29 @@ def update_confidence_scores(image_array, bounding_boxes, image_id):
         
         # Import the ImageObject database connector
         from backend.services.ImageObjectDatabaseConnector import MYSQLImageObjectDatabaseConnector
-        from DataTypes import ImageObject
+        from backend.services.DataTypes import ImageObject
         import uuid
-        
-        # Create a connector
-        obj_connector = MYSQLImageObjectDatabaseConnector()
         
         # If bounding_boxes is None or empty, just return
         if bounding_boxes is None or len(bounding_boxes) == 0:
             print("No bounding boxes to save as ImageObjects")
             return
+        
+        # Create a connector with retries
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                obj_connector = MYSQLImageObjectDatabaseConnector()
+                break
+            except ConnectionError as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to connect to database after {max_retries} attempts")
+                    raise
+                print(f"Connection attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
+                import time
+                time.sleep(retry_delay)
         
         # For each bounding box
         for box in bounding_boxes:
@@ -179,9 +208,13 @@ def update_confidence_scores(image_array, bounding_boxes, image_id):
                 
                 # Get all pixel coordinates within the bounding box
                 pixels = []
+                # To reduce data size, only store boundary pixels
                 for y in range(y1, y2):
-                    for x in range(x1, x2):
-                        pixels.append([x, y])
+                    pixels.append([x1, y])  # Left edge
+                    pixels.append([x2, y])  # Right edge
+                for x in range(x1, x2):
+                    pixels.append([x, y1])  # Top edge
+                    pixels.append([x, y2])  # Bottom edge
                 
                 # Create ImageObject instance
                 image_object = ImageObject(
@@ -193,10 +226,18 @@ def update_confidence_scores(image_array, bounding_boxes, image_id):
                     related_labels=[]  # No labels initially
                 )
                 
-                # Save to ImageObjects table
-                obj_connector.push_imageobject(image_object)
-                
-                print(f"Saved ImageObject for detection at ({x1},{y1},{x2},{y2}) with confidence {image_object.Confidence}")
+                # Save to ImageObjects table with retry
+                for attempt in range(max_retries):
+                    try:
+                        obj_connector.push_imageobject(image_object)
+                        print(f"Saved ImageObject for detection at ({x1},{y1},{x2},{y2}) with confidence {image_object.Confidence}")
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            print(f"Failed to save ImageObject after {max_retries} attempts")
+                            raise
+                        print(f"Save attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
             else:
                 print(f"Warning: Empty ROI at ({x1},{y1},{x2},{y2}), skipping object creation")
                 
@@ -210,9 +251,14 @@ def update_confidence_scores(image_array, bounding_boxes, image_id):
 def save_detections_to_db(input_image, bounding_boxes, project_id):
     """Save the detection results to the database."""
     try:
-        # Create a database connector
+        # Create database connectors
         from backend.services.LabelDatabaseConnector import MYSQLLabelDatabaseConnector
+        from backend.services.ImageObjectDatabaseConnector import MYSQLImageObjectDatabaseConnector
+        from backend.services.DataTypes import ImageObject
+        import uuid
+        
         db_connector = MYSQLLabelDatabaseConnector()
+        obj_connector = MYSQLImageObjectDatabaseConnector()
         
         # Push the input image to get an image ID
         image_id = db_connector.push_image(input_image, project_id)
@@ -228,20 +274,47 @@ def save_detections_to_db(input_image, bounding_boxes, project_id):
             print("No bounding boxes to save")
             return image_id
         
-        # Save each bounding box as a label
+        # Save each bounding box as a label and ImageObject
         for box in bounding_boxes:
-            # Create a label object
+            x1, y1, x2, y2 = int(box['x1']), int(box['y1']), int(box['x2']), int(box['y2'])
+            confidence = box.get('confidence', 0.95)
+            
+            # Create and save label
             label = {
                 "image_id": image_id,
-                "x1": float(box['x1']),
-                "y1": float(box['y1']),
-                "x2": float(box['x2']),
-                "y2": float(box['y2']),
-                "confidence": 1.0  # Default confidence score
+                "x1": float(x1),
+                "y1": float(y1),
+                "x2": float(x2),
+                "y2": float(y2),
+                "confidence": confidence
             }
-            
-            # Push the label to the database
             db_connector.push_label(label)
+            
+            # Create and save ImageObject
+            object_id = str(uuid.uuid4())
+            
+            # Get boundary pixels
+            pixels = []
+            for y in range(y1, y2):
+                pixels.append([x1, y])  # Left edge
+                pixels.append([x2, y])  # Right edge
+            for x in range(x1, x2):
+                pixels.append([x, y1])  # Top edge
+                pixels.append([x, y2])  # Bottom edge
+            
+            # Create ImageObject instance
+            image_object = ImageObject(
+                ImageObjectID=object_id,
+                ImageID=str(image_id),
+                Class='airplane',  # Update this if you have multiple classes
+                Confidence=confidence,
+                related_pixels=pixels,
+                related_labels=[]  # No labels initially
+            )
+            
+            # Save ImageObject
+            obj_connector.push_imageobject(image_object)
+            print(f"Saved detection at ({x1},{y1},{x2},{y2}) with confidence {confidence}")
         
         return image_id
         
@@ -251,7 +324,7 @@ def save_detections_to_db(input_image, bounding_boxes, project_id):
         traceback.print_exc()
         return None
 
-def detector(model_fname, in_fname, out_fname=None):
+def detector(model_fname, in_fname, out_fname=None, confidence_threshold=0.5):
     """Perform a sliding window detector on an image."""
     if out_fname is None:
         out_fname = os.path.splitext(in_fname)[0] + '_detection.png'
@@ -262,10 +335,10 @@ def detector(model_fname, in_fname, out_fname=None):
     output = np.copy(arr)
 
     # Perform sliding window detection
-    detections, confidences = sliding_window_detection(arr)
+    detections, confidences = sliding_window_detection(arr, confidence_threshold=confidence_threshold)
 
     # Draw bounding boxes and get bounding box data
-    output, bounding_boxes = draw_bounding_boxes(output, detections, confidences, win=20)
+    output, bounding_boxes = draw_bounding_boxes(output, detections, confidences, win=20, confidence_threshold=confidence_threshold)
 
     # Save the processed output image
     save_output_image(output, out_fname)
@@ -280,15 +353,7 @@ def detector(model_fname, in_fname, out_fname=None):
         print("-" * 50)
     print(f"\nTotal detections: {len(bounding_boxes)}")
     
-    # Save detections to database using the input image path
-    project_id = 5  # Use the project ID from test_upload.py
-    image_id = save_detections_to_db(in_fname, bounding_boxes, project_id)
-    
-    # Update confidence scores
-    if image_id:
-        update_confidence_scores(np.array(Image.open(in_fname)), bounding_boxes, image_id)
-    
-    print("Detection script completed.")
+    return bounding_boxes
 
 def main():
     """Run the airplane detector on an input image."""
@@ -299,6 +364,7 @@ def main():
     parser.add_argument('--model', type=str, default=DEFAULT_MODEL_PATH, help='Path to model file')
     parser.add_argument('--output', type=str, default=None, help='Path to output image')
     parser.add_argument('--project_id', type=int, default=5, help='Project ID for database')
+    parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold for detections')
     
     # Check if we're getting multiple positional arguments (old format)
     if len(sys.argv) > 2 and not sys.argv[2].startswith('--'):
@@ -307,6 +373,7 @@ def main():
         input_image = sys.argv[2]
         output_path = sys.argv[3] if len(sys.argv) > 3 else None
         project_id = 5  # Default project ID
+        confidence_threshold = 0.5  # Default confidence
     else:
         # New format with named arguments
         args = parser.parse_args()
@@ -314,21 +381,17 @@ def main():
         model_path = args.model
         output_path = args.output
         project_id = args.project_id
+        confidence_threshold = args.confidence
     
     print(f"Loading model from {model_path}...")
     print(f"Reading input image from {input_image}...")
+    print(f"Using confidence threshold: {confidence_threshold}")
     
     # Run the detector
-    bounding_boxes = detector(model_path, input_image, output_path)
+    bounding_boxes = detector(model_path, input_image, output_path, confidence_threshold=confidence_threshold)
     
-    # Save detections to database
-    image_id = save_detections_to_db(input_image, bounding_boxes, project_id)
-    
-    # If we got a valid image_id, update confidence scores
-    if image_id:
-        # Load the image as numpy array for update_confidence_scores
-        image_array = np.array(Image.open(input_image))
-        update_confidence_scores(image_array, bounding_boxes, image_id)
+    # Save all detections to database (both Labels and ImageObjects)
+    save_detections_to_db(input_image, bounding_boxes, project_id)
     
     return 0
 
