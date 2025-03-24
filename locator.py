@@ -150,17 +150,19 @@ def update_confidence_scores(image_array, bounding_boxes, image_id):
         image_id: ID of the image in the database
     """
     try:
-        print("Updating confidence scores for detected objects...")
+        print("Saving detected objects to ImageObjects table...")
         
-        # Import the ICM database connector
-        from backend.services.ImageClassMeasureDatabaseConnector import MYSQLImageClassMeasureDatabaseConnector
+        # Import the ImageObject database connector
+        from backend.services.ImageObjectDatabaseConnector import MYSQLImageObjectDatabaseConnector
+        from DataTypes import ImageObject
+        import uuid
         
         # Create a connector
-        icm_connector = MYSQLImageClassMeasureDatabaseConnector()
+        obj_connector = MYSQLImageObjectDatabaseConnector()
         
         # If bounding_boxes is None or empty, just return
         if bounding_boxes is None or len(bounding_boxes) == 0:
-            print("No bounding boxes to update confidence scores for")
+            print("No bounding boxes to save as ImageObjects")
             return
         
         # For each bounding box
@@ -170,28 +172,38 @@ def update_confidence_scores(image_array, bounding_boxes, image_id):
             # Extract region of interest
             roi = image_array[y1:y2, x1:x2]
             
-            # Apply the CNN model to get a confidence score
-            if roi.size > 0:  # Make sure we have a valid ROI
-                # Calculate a confidence score (placeholder for actual CNN model)
-                # In practice, you'd call your CNN model here
-                confidence = 0.95  # Example value
+            # Only process valid ROIs
+            if roi.size > 0:
+                # Generate a unique ID for this object
+                object_id = str(uuid.uuid4())
                 
-                # Save to ImageClassMeasure table
-                icm_data = {
-                    "ImageID": image_id,
-                    "ClassName": "airplane",
-                    "Confidence": confidence
-                }
-                icm_connector.push_icm(icm_data)
+                # Get all pixel coordinates within the bounding box
+                pixels = []
+                for y in range(y1, y2):
+                    for x in range(x1, x2):
+                        pixels.append([x, y])
                 
-                print(f"Updated confidence score for object at ({x1},{y1},{x2},{y2}): {confidence}")
+                # Create ImageObject instance
+                image_object = ImageObject(
+                    ImageObjectID=object_id,
+                    ImageID=str(image_id),
+                    Class='airplane',  # Update this if you have multiple classes
+                    Confidence=box.get('confidence', 0.95),  # Use detection confidence or default
+                    related_pixels=pixels,
+                    related_labels=[]  # No labels initially
+                )
+                
+                # Save to ImageObjects table
+                obj_connector.push_imageobject(image_object)
+                
+                print(f"Saved ImageObject for detection at ({x1},{y1},{x2},{y2}) with confidence {image_object.Confidence}")
             else:
-                print(f"Warning: Empty ROI at ({x1},{y1},{x2},{y2}), skipping confidence update")
+                print(f"Warning: Empty ROI at ({x1},{y1},{x2},{y2}), skipping object creation")
                 
-        print("Confidence score updates completed")
+        print("ImageObjects creation completed")
         
     except Exception as e:
-        print(f"Error updating confidence scores: {e}")
+        print(f"Error creating ImageObjects: {e}")
         import traceback
         traceback.print_exc()
 
