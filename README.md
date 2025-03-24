@@ -117,3 +117,5 @@ After successful execution, the output will be saved in the `Landscape_Views/` f
     - Check that the input image path passed to `locator.py` exists and is correctly formatted.
 
 ---
+
+python model/locator.py model/model.tfl model/Landscape_Views/landscape_A.png
