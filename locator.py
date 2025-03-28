@@ -3,7 +3,7 @@ import sys
 import os
 import numpy as np
 from PIL import Image
-from cnn_model import model  # Your trained CNN model module
+from cnn_model import model
 from pathlib import Path
 
 # Add the project root to Python path
