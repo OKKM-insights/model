@@ -1,38 +1,46 @@
 #!/usr/bin/env python3
 import sys
 import os
+import uuid
+import datetime
 import numpy as np
-from PIL import Image
-from cnn_model import model  # Your trained CNN model module
+from PIL import Image, ImageDraw, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from pathlib import Path
 
-# Add the project root to Python path
+# Ensure the project root is in the PYTHONPATH
 project_root = str(Path(__file__).parent.parent)
 sys.path.append(project_root)
 
-from backend.services.DataTypes import ImageObject
+# Import DB connectors and services
+from backend.services.ProjectDatabaseConnector import MYSQLProjectDatabaseConnector
+from backend.services.LabelDatabaseConnector import MYSQLLabelDatabaseConnector
+from backend.services.LabellerDatabaseConnector import MYSQLLabellerDatabaseConnector
+from backend.services.ImageObjectDatabaseConnector import MYSQLImageObjectDatabaseConnector
+from backend.services.ObjectExtractionService import ObjectExtractionService
+from backend.services.ImageClassMeasureDatabaseConnector import MYSQLImageClassMeasureDatabaseConnector
+from backend.services.DataTypes import Labeller, Label, Image as DBImage, ImageObject
+from backend.services.ObjectExtractionManager import ObjectExtractionManager
+from cnn_model import model  # Your trained CNN model module
 
 def load_model(model_fname: str) -> None:
-    """Load the trained machine learning model."""
     print(f"Loading model from {model_fname}...")
     model.load(model_fname)
     print("Model loaded successfully.")
 
-def preprocess_image(in_fname: str) -> np.ndarray:
-    """Load and preprocess the input image (ensuring RGB channels)."""
-    print(f"Reading input image from {in_fname}...")
-    im = Image.open(in_fname)
-    # Force to RGB in case image has an alpha channel or is grayscale
-    im = im.convert("RGB")
+def preprocess_image_from_db(db_image: DBImage) -> np.ndarray:
+    """
+    Convert the DB image (a PIL Image stored in db_image.image_data) to a numpy array.
+    """
+    im = db_image.image_data.convert("RGB")
     arr = np.array(im)
     print(f"Image loaded with shape {arr.shape}.")
     return arr
 
-def sliding_window_detection(arr: np.ndarray, step: int = 10, win: int = 20, threshold: float = 0.5) -> list:
+def sliding_window_detection(arr: np.ndarray, step: int = 20, win: int = 20, threshold: float = 0.5) -> list:
     """
-    Perform sliding window detection on the image array.
-    Returns a list of detections, each as a tuple: 
-        (x_min, y_min, x_max, y_max, confidence)
+    Run sliding window detection over the image.
+    Returns a list of detections: each a tuple (x_min, y_min, x_max, y_max, confidence).
     """
     detections = []
     height, width, _ = arr.shape
@@ -40,101 +48,116 @@ def sliding_window_detection(arr: np.ndarray, step: int = 10, win: int = 20, thr
     for i in range(0, height - win, step):
         for j in range(0, width - win, step):
             chip = arr[i:i+win, j:j+win, :]
-            # Normalize chip: scale pixel values to [0, 1]
             chip_normalized = chip / 255.0
-            # Model expects input shape (1, win, win, 3)
             prediction = model.predict(chip_normalized[np.newaxis, ...])[0]
-            # We assume the model returns a probability vector: [prob_background, prob_airplane]
-            confidence = prediction[1]
+            confidence = prediction[1]  # Assuming [prob_background, prob_airplane]
             if confidence >= threshold:
-                # Record detection as (x_min, y_min, x_max, y_max, confidence)
-                detection = (j, i, j + win, i + win, confidence)
-                detections.append(detection)
+                detections.append((j, i, j + win, i + win, confidence))
     print(f"Sliding window detection completed with {len(detections)} detections.")
     return detections
 
-def draw_bounding_boxes(arr: np.ndarray, detections: list, box_color: list = [255, 0, 0], thickness: int = 2) -> np.ndarray:
+def consensus_bounding_box(detections: list):
     """
-    Draw bounding boxes on the image array.
-    Each detection is a tuple (x_min, y_min, x_max, y_max, confidence).
+    Compute the union (consensus) bounding box of all detection boxes.
+    Returns (x_min, y_min, x_max, y_max) or None if no detections.
     """
-    output = arr.copy()
-    for (x_min, y_min, x_max, y_max, confidence) in detections:
-        # Draw top and bottom edges
-        output[y_min:y_min+thickness, x_min:x_max, :] = box_color
-        output[y_max-thickness:y_max, x_min:x_max, :] = box_color
-        # Draw left and right edges
-        output[y_min:y_max, x_min:x_min+thickness, :] = box_color
-        output[y_min:y_max, x_max-thickness:x_max, :] = box_color
-    return output
+    if not detections:
+        return None
+    x_min = min(det[0] for det in detections)
+    y_min = min(det[1] for det in detections)
+    x_max = max(det[2] for det in detections)
+    y_max = max(det[3] for det in detections)
+    return (x_min, y_min, x_max, y_max)
 
-def convert_detections_to_image_objects(detections: list, image_id: str, class_name: str) -> list:
+def draw_bounding_box_on_image(arr: np.ndarray, bbox, color: tuple = (0, 255, 0), thickness: int = 3) -> np.ndarray:
     """
-    Convert each detection (bounding box tuple) into an ImageObject.
-    Here we store a simple representation of the bounding box in `related_pixels`
-    (for example, the top-left and bottom-right coordinates).
+    Draw the bounding box (bbox) on the image.
+    Uses PIL's ImageDraw. Returns a numpy array.
     """
-    image_objects = []
+    if bbox is None:
+        return arr
+    x_min, y_min, x_max, y_max = bbox
+    im = Image.fromarray(arr)
+    draw = ImageDraw.Draw(im)
+    for t in range(thickness):
+        draw.rectangle([x_min + t, y_min + t, x_max - t, y_max - t], outline=color)
+    return np.array(im)
+
+def push_detections_as_labels(detections: list, db_image: DBImage, class_name: str, label_db) -> None:
+    """
+    For each detection, create a new Label with a new LabelID and push it to the DB.
+    You can adjust the LabellerID, offsets, and Class fields as needed.
+    """
     for (x_min, y_min, x_max, y_max, confidence) in detections:
-        # For a more refined representation, you might compute all pixels or the connected component.
-        related_pixels = [(x_min, y_min), (x_max, y_max)]
-        obj = ImageObject(
-            ImageObjectID=None,      # Let the constructor assign a new UUID if None
-            ImageID=image_id,
+        new_label = Label(
+            LabelID=str(uuid.uuid4()),
+            LabellerID=0,              # Use an appropriate LabellerID (as string) that exists in your DB
+            ImageID=1,    # Ensure this ImageID exists in your Images table
             Class=class_name,
-            Confidence=confidence,
-            related_pixels=related_pixels,
-            related_labels=[]        # Populate with associated Label objects if available
+            top_left_x=x_min,
+            top_left_y=y_min,
+            bot_right_x=x_max,
+            bot_right_y=y_max,
+            offset_x=300,                # Adjust as needed
+            offset_y=300,                # Adjust as needed
+            creation_time=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            origImageID=db_image.ImageID
         )
-        image_objects.append(obj)
-    return image_objects
+        try:
+            label_db.push_label(new_label)
+            print(f"Label pushed to DB with LabelID={new_label.LabelID}.")
+        except Exception as e:
+            print("Error pushing label:", e)
 
 def main():
-    """
-    Complete workflow:
-      1. Load model and image.
-      2. Run sliding window detection.
-      3. Draw bounding boxes and save output image.
-      4. Convert detections to ImageObject instances.
-      5. (Optional) Push ImageObjects to your database.
-    """
-    if len(sys.argv) < 4:
-        print("Usage: python object_detection_and_db.py <model_fname> <in_image_fname> <image_id> [<out_image_fname>]")
-        sys.exit(1)
+    # Prompt for project ID, class, and model filename
+    project_id = input("Enter project ID to process: ").strip()
+    class_name = input("Enter class to extract (e.g., 'plane'): ").strip()
     
-    model_fname = sys.argv[1]
-    in_fname = sys.argv[2]
-    image_id = sys.argv[3]      # Unique identifier for the image, e.g. from your DB or project
-    out_fname = sys.argv[4] if len(sys.argv) > 4 else os.path.splitext(in_fname)[0] + "_detection.png"
-    class_name = "airplane"     # Update as needed
+    # Initialize DB connectors and services
+    project_db = MYSQLProjectDatabaseConnector()
+    label_db = MYSQLLabelDatabaseConnector()
+    labeller_db = MYSQLLabellerDatabaseConnector()
+    imageobject_db = MYSQLImageObjectDatabaseConnector()
+    icm_db = MYSQLImageClassMeasureDatabaseConnector()
 
-    # Load model and image
-    load_model(model_fname)
-    arr = preprocess_image(in_fname)
+    object_service = ObjectExtractionService(icm_db, labeller_db)
+    manager = ObjectExtractionManager(project_db, label_db, labeller_db, imageobject_db, object_service)
     
-    # Perform sliding window detection
+    # Retrieve the project and select the first image
+    projects = project_db.get_projects(f"SELECT * FROM my_image_db.Projects WHERE ProjectID = {project_id};")
+    if not projects:
+        print(f"No project found with ID {project_id}")
+        return
+    project = projects[0]
+    if not project.images:
+        print("No images in the project.")
+        return
+    db_image = project.images[0]
+    print(f"Processing image with ImageID: {db_image.ImageID}")
+
+    # Convert the DB image to a numpy array
+    arr = preprocess_image_from_db(db_image)
+
+    # Run sliding window detection on the image
     detections = sliding_window_detection(arr, step=10, win=20, threshold=0.5)
-    
-    # Draw bounding boxes on the image and save output
-    output = draw_bounding_boxes(arr, detections)
-    Image.fromarray(output).save(out_fname)
-    print(f"Output image with detections saved to {out_fname}.")
 
-    # Convert detections to ImageObject instances (for unified DB storage)
-    image_objects = convert_detections_to_image_objects(detections, image_id, class_name)
-    
-    # For demonstration, print the image object details.
-    print("Detected ImageObjects:")
-    for obj in image_objects:
-        print(f"ImageObject - ImageID: {obj.ImageID}, Class: {obj.Class}, "
-              f"Confidence: {obj.Confidence:.2f}, Related Pixels: {obj.related_pixels}")
-    
-    # If desired, use your ImageObjectDatabaseConnector to push these objects to the DB.
-    # For example:
-    # from ImageObjectDatabaseConnector import MYSQLImageObjectDatabaseConnector
-    # db_connector = MYSQLImageObjectDatabaseConnector()
-    # for obj in image_objects:
-    #     db_connector.push_imageobject(obj)
+    # Compute the consensus bounding box
+    bbox = consensus_bounding_box(detections)
+    print("Consensus Bounding Box:", bbox)
+
+    # Draw the consensus bounding box on the image
+    arr_with_bbox = draw_bounding_box_on_image(arr, bbox, color=(0, 255, 0), thickness=3)
+    out_fname = f"extracted_{db_image.ImageID}.png"
+    Image.fromarray(arr_with_bbox).save(out_fname)
+    print(f"Output image with consensus bounding box saved as {out_fname}.")
+
+    # Push all detections as new label entries in the DB
+    push_detections_as_labels(detections, db_image, class_name, label_db)
+
+    print("Object extraction completed.")
 
 if __name__ == "__main__":
+    model_fname = input("Enter model filename: ").strip()
+    load_model(model_fname)
     main()
