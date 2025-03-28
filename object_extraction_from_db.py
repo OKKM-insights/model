@@ -70,6 +70,25 @@ def main():
     labels = label_db.get_labels(query_labels)
     print(f"Found {len(labels)} labels for image {image.ImageID} and class '{class_name}'.")
     
+'''
+
+     # This call will pull the specified project from the DB,
+    # iterate through its images, run the object extraction logic,
+    # and push the resulting ImageObjects back into the DB.
+
+    #IMPORTANT - Commented this out as this is pixel wise, for testing purposes following a faster approach using simple bounding.
+
+    # manager.get_objects(project_id, class_name)
+
+     #calling the simple implementation
+    image_shape = (image.image_data.height, image.image_data.width)
+    bbox = _simple_consensus_bounding_box(labels, image_shape, consensus_threshold=0.5)
+    # In your main logic, ensure you pass the correct parameters:
+    # For example, if 'image' is loaded and 'labels' is your list of label objects:
+    bbox = get_consensus_bbox(image, labels, threshold=0.5)
+
+'''
+
     # Calculate consensus bounding boxes using two simple implementations.
     bbox_simple = _simple_consensus_bounding_box(labels, (image.image_data.height, image.image_data.width), consensus_threshold=0.5)
     bbox = get_consensus_bbox(image, labels, threshold=0.5)
