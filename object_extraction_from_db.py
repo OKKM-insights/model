@@ -31,25 +31,33 @@ def load_model(model_fname: str) -> None:
 def ensure_image_in_db(db_image: DBImage, project_db: MYSQLProjectDatabaseConnector):
     """
     Ensure that the image record (by db_image.ImageID) exists in the Images table.
-    If it does not exist, insert it.
-    (Requires that project_db has get_images() and push_image() methods.)
+    If not, insert it.
+    If project_db does not support get_images() or push_image(), this function will warn and skip.
     """
+    if not hasattr(project_db, "get_images"):
+        print("WARNING: ProjectDatabaseConnector has no get_images() method. Skipping image check.")
+        return
     query = f"SELECT * FROM Images WHERE id = {db_image.ImageID};"
     images = project_db.get_images(query)
     if not images:
         print(f"Image with ID {db_image.ImageID} not found in Images table. Inserting now.")
-        project_db.push_image(db_image)
+        if hasattr(project_db, "push_image"):
+            project_db.push_image(db_image)
+        else:
+            print("WARNING: ProjectDatabaseConnector has no push_image() method.")
     else:
         print(f"Image with ID {db_image.ImageID} already exists in Images table.")
 
 def preprocess_image_from_db(db_image: DBImage) -> np.ndarray:
-    """Convert the DB image (stored as a PIL image in db_image.image_data) to a numpy array."""
+    """
+    Convert the DB image (a PIL Image stored in db_image.image_data) to a numpy array.
+    """
     im = db_image.image_data.convert("RGB")
     arr = np.array(im)
     print(f"Image loaded with shape {arr.shape}.")
     return arr
 
-def sliding_window_detection(arr: np.ndarray, step: int = 10, win: int = 20, threshold: float = 0.5) -> list:
+def sliding_window_detection(arr: np.ndarray, step: int = 2, win: int = 20, threshold: float = 0.5) -> list:
     """
     Run sliding window detection over the image.
     Returns a list of detections, where each detection is a tuple:
@@ -63,17 +71,17 @@ def sliding_window_detection(arr: np.ndarray, step: int = 10, win: int = 20, thr
             chip = arr[i:i+win, j:j+win, :]
             chip_normalized = chip / 255.0
             prediction = model.predict(chip_normalized[np.newaxis, ...])[0]
-            # We assume the model returns a probability vector, e.g. [prob_background, prob_airplane]
+            # We assume the model returns a probability vector [prob_background, prob_airplane]
             confidence = prediction[1]
             if confidence >= threshold:
-                detections.append((j, i, j + win, i + win, confidence))
+                detections.append((j, i, j+win, i+win, confidence))
     print(f"Sliding window detection completed with {len(detections)} detections.")
     return detections
 
 def consensus_bounding_box(detections: list):
     """
     Compute the union (consensus) bounding box of all detection boxes.
-    Returns a tuple (x_min, y_min, x_max, y_max) or None if there are no detections.
+    Returns (x_min, y_min, x_max, y_max) or None if no detections.
     """
     if not detections:
         return None
@@ -106,8 +114,8 @@ def push_detections_as_labels(detections: list, db_image: DBImage, class_name: s
     for (x_min, y_min, x_max, y_max, confidence) in detections:
         new_label = {
             "LabelID": str(uuid.uuid4()),
-            "LabellerID": 0,              # Adjust this to a valid LabellerID as needed
-            "ImageID": 1,    # This must match an existing record in the Images table!
+            "LabellerID": 0,              # Use a valid LabellerID (as a string)
+            "ImageID": 1,    # Must match an existing record in Images!
             "Class": class_name,
             "top_left_x": x_min,
             "top_left_y": y_min,
@@ -140,7 +148,7 @@ def main():
     
     # Initialize DB connectors and service objects
     project_db = MYSQLProjectDatabaseConnector()
-    label_db = MYSQLLabelDatabaseConnector()  # This connector must implement push_labels_batch()
+    label_db = MYSQLLabelDatabaseConnector()  # Must implement push_labels_batch()
     labeller_db = MYSQLLabellerDatabaseConnector()
     imageobject_db = MYSQLImageObjectDatabaseConnector()
     icm_db = MYSQLImageClassMeasureDatabaseConnector()
@@ -159,10 +167,10 @@ def main():
     db_image = project.images[0]
     print(f"Processing image with ImageID: {db_image.ImageID}")
     
-    # Ensure that the image record exists in the Images table (to satisfy foreign key constraints)
+    # Ensure the image record exists in the Images table (if supported by project_db)
     ensure_image_in_db(db_image, project_db)
     
-    # Preprocess the image from the DB into a NumPy array
+    # Preprocess the image from the DB into a numpy array
     arr = preprocess_image_from_db(db_image)
     
     # Run sliding window detection on the image
@@ -178,7 +186,7 @@ def main():
     Image.fromarray(arr_with_bbox).save(out_fname)
     print(f"Output image with consensus bounding box saved as {out_fname}.")
     
-    # Convert each detection into a new label and push them to the database (batched)
+    # Push each detection as a new Label in batches
     push_detections_as_labels(detections, db_image, class_name, label_db, batch_size=100)
     
     print("Object extraction completed.")
