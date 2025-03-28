@@ -30,9 +30,8 @@ def load_model(model_fname: str) -> None:
 
 def ensure_image_in_db(db_image: DBImage, project_db: MYSQLProjectDatabaseConnector):
     """
-    Ensure that the image record (by db_image.ImageID) exists in the Images table.
+    Ensure that the image record exists in the Images table.
     If not, insert it.
-    If project_db does not support get_images() or push_image(), this function will warn and skip.
     """
     if not hasattr(project_db, "get_images"):
         print("WARNING: ProjectDatabaseConnector has no get_images() method. Skipping image check.")
@@ -57,72 +56,98 @@ def preprocess_image_from_db(db_image: DBImage) -> np.ndarray:
     print(f"Image loaded with shape {arr.shape}.")
     return arr
 
-def sliding_window_detection(arr: np.ndarray, step: int = 2, win: int = 20, threshold: float = 0.5) -> list:
+def compute_iou(box1: tuple, box2: tuple) -> float:
     """
-    Run sliding window detection over the image.
-    Returns a list of detections, where each detection is a tuple:
-      (x_min, y_min, x_max, y_max, confidence).
+    Compute Intersection over Union (IoU) between two boxes.
+    Each box is defined as (x_min, y_min, x_max, y_max).
     """
-    detections = []
-    height, width, _ = arr.shape
-    print("Starting sliding window detection...")
-    for i in range(0, height - win, step):
-        for j in range(0, width - win, step):
-            chip = arr[i:i+win, j:j+win, :]
-            chip_normalized = chip / 255.0
-            prediction = model.predict(chip_normalized[np.newaxis, ...])[0]
-            # We assume the model returns a probability vector [prob_background, prob_airplane]
-            confidence = prediction[1]
-            if confidence >= threshold:
-                detections.append((j, i, j+win, i+win, confidence))
-    print(f"Sliding window detection completed with {len(detections)} detections.")
-    return detections
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = area1 + area2 - inter_area
+    return inter_area / union_area if union_area > 0 else 0
 
-def consensus_bounding_box(detections: list):
+def non_max_suppression(detections: list, iou_threshold: float = 0.3) -> list:
     """
-    Compute the union (consensus) bounding box of all detection boxes.
-    Returns (x_min, y_min, x_max, y_max) or None if no detections.
+    Filter overlapping detections using Non-Maximum Suppression.
+    Each detection is (x_min, y_min, x_max, y_max, confidence).
     """
     if not detections:
-        return None
-    x_min = min(det[0] for det in detections)
-    y_min = min(det[1] for det in detections)
-    x_max = max(det[2] for det in detections)
-    y_max = max(det[3] for det in detections)
-    return (x_min, y_min, x_max, y_max)
+        return []
+    # Sort detections by confidence (highest first)
+    detections = sorted(detections, key=lambda x: x[4], reverse=True)
+    final_detections = []
+    while detections:
+        best = detections.pop(0)
+        final_detections.append(best)
+        detections = [d for d in detections if compute_iou(best, d) < iou_threshold]
+    return final_detections
 
-def draw_bounding_box_on_image(arr: np.ndarray, bbox, color: tuple = (0, 255, 0), thickness: int = 3) -> np.ndarray:
+def sliding_window_detection_multiscale(arr: np.ndarray, scales: list = [1.0, 0.8, 0.6, 0.4],
+                                          step: int = 10, win: int = 20, threshold: float = 0.5) -> list:
     """
-    Draw the bounding box (bbox) on the image using PIL's ImageDraw.
-    Returns the resulting image as a numpy array.
+    Run sliding window detection over multiple scales.
+    Returns a list of detections: each detection is (x_min, y_min, x_max, y_max, confidence).
     """
-    if bbox is None:
-        return arr
-    x_min, y_min, x_max, y_max = bbox
+    detections = []
+    orig_h, orig_w, _ = arr.shape
+    print("Starting multi-scale sliding window detection...")
+    for scale in scales:
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        scaled_img = np.array(Image.fromarray(arr).resize((new_w, new_h), Image.ANTIALIAS))
+        print(f"Processing scale {scale:.2f} with image size ({new_w}, {new_h})")
+        for i in range(0, new_h - win, step):
+            for j in range(0, new_w - win, step):
+                chip = scaled_img[i:i+win, j:j+win, :]
+                chip_normalized = chip / 255.0
+                prediction = model.predict(chip_normalized[np.newaxis, ...])[0]
+                confidence = prediction[1]  # Assuming [prob_background, prob_airplane]
+                if confidence >= threshold:
+                    # Map detection coordinates back to the original image scale
+                    x_min = int(j / scale)
+                    y_min = int(i / scale)
+                    x_max = int((j + win) / scale)
+                    y_max = int((i + win) / scale)
+                    detections.append((x_min, y_min, x_max, y_max, confidence))
+    print(f"Raw multi-scale detections: {len(detections)}")
+    return detections
+
+def draw_bounding_boxes_on_image(arr: np.ndarray, detections: list,
+                                 color: tuple = (0, 255, 0), thickness: int = 3) -> np.ndarray:
+    """
+    Draw all bounding boxes on the image.
+    Each detection is (x_min, y_min, x_max, y_max, confidence).
+    """
     im = Image.fromarray(arr)
     draw = ImageDraw.Draw(im)
-    for t in range(thickness):
-        draw.rectangle([x_min+t, y_min+t, x_max-t, y_max-t], outline=color)
+    for (x_min, y_min, x_max, y_max, conf) in detections:
+        for t in range(thickness):
+            draw.rectangle([x_min+t, y_min+t, x_max-t, y_max-t], outline=color)
     return np.array(im)
 
-def push_detections_as_labels(detections: list, db_image: DBImage, class_name: str, label_db: MYSQLLabelDatabaseConnector, batch_size=100):
+def push_detections_as_labels(detections: list, db_image: DBImage, class_name: str,
+                              label_db: MYSQLLabelDatabaseConnector, batch_size=100):
     """
-    For each detection, create a new Label (with a new LabelID) and push it to the DB in batches.
-    This function assumes that label_db has a method push_labels_batch(labels_batch: list).
+    For each detection, create a new Label (with a unique LabelID) and push it to the DB in batches.
     """
     batch = []
     for (x_min, y_min, x_max, y_max, confidence) in detections:
         new_label = {
             "LabelID": str(uuid.uuid4()),
-            "LabellerID": 0,              # Use a valid LabellerID (as a string)
-            "ImageID": 1,    # Must match an existing record in Images!
+            "LabellerID": 0,              # Use a valid LabellerID
+            "ImageID": 1,                 # Must match an existing record in Images
             "Class": class_name,
             "top_left_x": x_min,
             "top_left_y": y_min,
             "bot_right_x": x_max,
             "bot_right_y": y_max,
-            "offset_x": 300,                # Adjust as needed
-            "offset_y": 300,                # Adjust as needed
+            "offset_x": 300,              # Adjust as needed
+            "offset_y": 300,              # Adjust as needed
             "creation_time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "origImageID": db_image.ImageID
         }
@@ -167,27 +192,39 @@ def main():
     db_image = project.images[0]
     print(f"Processing image with ImageID: {db_image.ImageID}")
     
-    # Ensure the image record exists in the Images table (if supported by project_db)
+    # Ensure the image record exists in the Images table (if supported)
     ensure_image_in_db(db_image, project_db)
     
     # Preprocess the image from the DB into a numpy array
     arr = preprocess_image_from_db(db_image)
     
-    # Run sliding window detection on the image
-    detections = sliding_window_detection(arr, step=10, win=20, threshold=0.5)
+    # Run multi-scale sliding window detection on the image
+    raw_detections = sliding_window_detection_multiscale(
+        arr, scales=[1.0, 0.8, 0.6, 0.4], step=10, win=20, threshold=0.5)
     
-    # Compute the consensus bounding box (union of all detections)
-    bbox = consensus_bounding_box(detections)
-    print("Consensus Bounding Box:", bbox)
+    # Apply Non-Maximum Suppression (NMS) to reduce overlapping detections
+    final_detections = non_max_suppression(raw_detections, iou_threshold=0.3)
+    print(f"Final detections after NMS: {len(final_detections)}")
     
-    # Draw the consensus bounding box on the image and save the result
-    arr_with_bbox = draw_bounding_box_on_image(arr, bbox, color=(0, 255, 0), thickness=3)
+    # Optionally, compute a consensus bounding box (for reference)
+    if final_detections:
+        x_min = min(det[0] for det in final_detections)
+        y_min = min(det[1] for det in final_detections)
+        x_max = max(det[2] for det in final_detections)
+        y_max = max(det[3] for det in final_detections)
+        consensus_box = (x_min, y_min, x_max, y_max)
+        print("Consensus Bounding Box:", consensus_box)
+    else:
+        consensus_box = None
+    
+    # Draw all final bounding boxes on the image and save the result
+    arr_with_boxes = draw_bounding_boxes_on_image(arr, final_detections, color=(0, 255, 0), thickness=3)
     out_fname = f"extracted_{db_image.ImageID}.png"
-    Image.fromarray(arr_with_bbox).save(out_fname)
-    print(f"Output image with consensus bounding box saved as {out_fname}.")
+    Image.fromarray(arr_with_boxes).save(out_fname)
+    print(f"Output image with bounding boxes saved as {out_fname}.")
     
-    # Push each detection as a new Label in batches
-    push_detections_as_labels(detections, db_image, class_name, label_db, batch_size=100)
+    # Push each detection as a new label in batches
+    push_detections_as_labels(final_detections, db_image, class_name, label_db, batch_size=100)
     
     print("Object extraction completed.")
 
