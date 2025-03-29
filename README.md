@@ -119,3 +119,6 @@ After successful execution, the output will be saved in the `Landscape_Views/` f
 ---
 
 python model/locator.py model/model.tfl model/Landscape_Views/landscape_A.png
+
+
+python locator.py "model.tfl" "Landscape_Views/landscape_A.png" "imageid1"
