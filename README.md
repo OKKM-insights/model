@@ -122,3 +122,5 @@ python model/locator.py model/model.tfl model/Landscape_Views/landscape_A.png
 
 
 python locator.py "model.tfl" "Landscape_Views/landscape_A.png" "imageid1"
+
+ & C:/Users/{{User}}/AppData/Local/Programs/Python/Python310/python.exe c:/Users/{{User}}/OneDrive/Desktop/Captsone/model/object_extraction_from_db.py

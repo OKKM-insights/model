@@ -146,8 +146,8 @@ def push_detections_as_labels(detections: list, db_image: DBImage, class_name: s
             "top_left_y": y_min,
             "bot_right_x": x_max,
             "bot_right_y": y_max,
-            "offset_x": 300,              # Adjust as needed
-            "offset_y": 300,              # Adjust as needed
+            "offset_x": 0,              # Adjust as needed
+            "offset_y": 0,              # Adjust as needed
             "creation_time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "origImageID": db_image.ImageID
         }
