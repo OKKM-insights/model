@@ -1,324 +1,192 @@
-"""
-Apply a trained machine learning model to an entire image scene using a sliding window.
-"""
-
+#!/usr/bin/env python3
 import sys
 import os
-import numpy as np
-from PIL import Image
-from scipy import ndimage
-# First try the direct import, if that fails use a relative import
-try:
-    # This works when running as a module
-    from model.cnn_model import model
-except ImportError:
-    # This works when running the script directly
-    # Add the parent directory to sys.path
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    # Now try the import again
-    from model.cnn_model import model
-import time
-from dotenv import load_dotenv
-from sqlalchemy import text
+import uuid
 import datetime
-import argparse
+import numpy as np
+from PIL import Image, ImageDraw, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+from pathlib import Path
 
-# Add the project root directory to Python path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Ensure the project root is in the PYTHONPATH
+project_root = str(Path(__file__).parent.parent)
 sys.path.append(project_root)
 
-# Define default model path
-DEFAULT_MODEL_PATH = os.path.join("model", "model.tfl")
-
-# Now we can import from backend
+# Import DB connectors and services
+from backend.services.ProjectDatabaseConnector import MYSQLProjectDatabaseConnector
 from backend.services.LabelDatabaseConnector import MYSQLLabelDatabaseConnector
-from backend.services.DataTypes import Label, ImageClassMeasure
-from backend.services.ImageClassMeasureDatabaseConnector import MYSQLImageClassMeasureDatabaseConnector
-from backend.services.ObjectExtractionService import ObjectExtractionService
 from backend.services.LabellerDatabaseConnector import MYSQLLabellerDatabaseConnector
+from backend.services.ImageObjectDatabaseConnector import MYSQLImageObjectDatabaseConnector
+from backend.services.ObjectExtractionService import ObjectExtractionService
+from backend.services.ImageClassMeasureDatabaseConnector import MYSQLImageClassMeasureDatabaseConnector
+from backend.services.DataTypes import Labeller, Label, Image as DBImage, ImageObject
+from backend.services.ObjectExtractionManager import ObjectExtractionManager
+from cnn_model import model  # Your trained CNN model module
 
-# Load environment variables from backend/.env
-backend_env_path = os.path.join(project_root, 'backend', '.env')
-print(f"Loading environment variables from: {backend_env_path}")
-load_dotenv(backend_env_path)
-
-# Debug: Print environment variables (except password)
-print("\nDatabase Connection Info:")
-print(f"Host: {os.getenv('DB_HOSTNAME')}")
-print(f"User: {os.getenv('DB_USER')}")
-print(f"Database: {os.getenv('DB_NAME')}")
-print(f"Password: {'*' * len(os.getenv('DB_PASSWORD', ''))}")
-
-def load_model(model_fname):
-    """Load the trained machine learning model."""
+def load_model(model_fname: str) -> None:
     print(f"Loading model from {model_fname}...")
     model.load(model_fname)
     print("Model loaded successfully.")
 
-def preprocess_image(in_fname):
-    """Load and preprocess the input image."""
-    print(f"Reading input image from {in_fname}...")
-    im = Image.open(in_fname)
-    arr = np.array(im)[:, :, 0:3]  # Extract RGB channels
+def preprocess_image_from_db(db_image: DBImage) -> np.ndarray:
+    """
+    Convert the DB image (a PIL Image stored in db_image.image_data) to a numpy array.
+    """
+    im = db_image.image_data.convert("RGB")
+    arr = np.array(im)
     print(f"Image loaded with shape {arr.shape}.")
     return arr
 
-def sliding_window_detection(arr, step=10, win=20):
-    """Perform sliding window detection on the image array.
-    
-    Args:
-        arr: Input image array
-        step: Step size for sliding window (default: 10 pixels)
-        win: Window size (default: 20 pixels)
+def compute_iou(box1: tuple, box2: tuple) -> float:
     """
-    print("Initializing sliding window detection...")
-    shape = arr.shape
-    detections = np.zeros((shape[0], shape[1]), dtype='float32')
-    confidences = np.zeros((shape[0], shape[1]), dtype='float32')
-
-    # Loop through pixel positions
-    for i in range(0, shape[0] - win, step):
-        print(f"Processing row {i} of {shape[0] - win}...")
-        for j in range(0, shape[1] - win, step):
-            # Extract sub-chip
-            chip = arr[i:i+win, j:j+win, :]
-            
-            # Get prediction and confidence
-            prediction = model.predict([chip / 255.])[0]
-            confidence = prediction[1]  # Probability of being an airplane
-            
-            # Record detections and confidences
-            detections[i + int(win / 2), j + int(win / 2)] = 1 if confidence > 0.5 else 0
-            confidences[i + int(win / 2), j + int(win / 2)] = confidence
-
-    print("Sliding window detection completed.")
-    return detections, confidences
-
-def draw_bounding_boxes(output, detections, confidences, win, confidence_threshold=0.5):
-    """Draw bounding boxes on the detected locations."""
-    print("Processing detection locations...")
-    dilation = ndimage.binary_dilation(detections, structure=np.ones((3, 3)))
-    labels, n_labels = ndimage.label(dilation)
-    center_mass = ndimage.center_of_mass(dilation, labels, np.arange(n_labels) + 1)
-
-    # Ensure center_mass is iterable
-    if type(center_mass) == tuple:
-        center_mass = [center_mass]
-
-    bounding_boxes = []
-    for i, j in center_mass:
-        i, j = int(i - win / 2), int(j - win / 2)
-        
-        # Get confidence score for this detection
-        confidence = confidences[int(i + win/2), int(j + win/2)]
-        
-        # Only include detections above confidence threshold
-        if confidence >= confidence_threshold:
-            # Draw bounding box in output array
-            output[i:i+win, j:j+2, 0:3] = [255, 0, 0]  # Left edge
-            output[i:i+win, j+win-2:j+win, 0:3] = [255, 0, 0]  # Right edge
-            output[i:i+2, j:j+win, 0:3] = [255, 0, 0]  # Top edge
-            output[i+win-2:i+win, j:j+win, 0:3] = [255, 0, 0]  # Bottom edge
-            
-            # Add bounding box data
-            bounding_boxes.append({
-                'x1': j,
-                'y1': i,
-                'x2': j + win,
-                'y2': i + win,
-                'confidence': float(confidence)
-            })
-
-    print("Bounding boxes drawn.")
-    return output, bounding_boxes
-
-def save_output_image(output, out_fname):
-    """Save the processed output image."""
-    print(f"Saving output image to {out_fname}...")
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(out_fname), exist_ok=True)
-    out_img = Image.fromarray(output)
-    out_img.save(out_fname)
-    print("Output image saved successfully.")
-
-def update_confidence_scores(image_array, bounding_boxes, image_id):
-    """Update confidence scores for detected objects using CNN model.
-    
-    Args:
-        image_array: NumPy array of the original image
-        bounding_boxes: List of bounding boxes with detection information
-        image_id: ID of the image in the database
+    Compute Intersection-over-Union (IoU) of two bounding boxes.
+    Boxes are defined as (x_min, y_min, x_max, y_max).
     """
-    try:
-        print("Updating confidence scores for detected objects...")
-        
-        # Import the ICM database connector
-        from backend.services.ImageClassMeasureDatabaseConnector import MYSQLImageClassMeasureDatabaseConnector
-        
-        # Create a connector
-        icm_connector = MYSQLImageClassMeasureDatabaseConnector()
-        
-        # If bounding_boxes is None or empty, just return
-        if bounding_boxes is None or len(bounding_boxes) == 0:
-            print("No bounding boxes to update confidence scores for")
-            return
-        
-        # For each bounding box
-        for box in bounding_boxes:
-            x1, y1, x2, y2 = int(box['x1']), int(box['y1']), int(box['x2']), int(box['y2'])
-            
-            # Extract region of interest
-            roi = image_array[y1:y2, x1:x2]
-            
-            # Apply the CNN model to get a confidence score
-            if roi.size > 0:  # Make sure we have a valid ROI
-                # Calculate a confidence score (placeholder for actual CNN model)
-                # In practice, you'd call your CNN model here
-                confidence = 0.95  # Example value
-                
-                # Save to ImageClassMeasure table
-                icm_data = {
-                    "ImageID": image_id,
-                    "ClassName": "airplane",
-                    "Confidence": confidence
-                }
-                icm_connector.push_icm(icm_data)
-                
-                print(f"Updated confidence score for object at ({x1},{y1},{x2},{y2}): {confidence}")
-            else:
-                print(f"Warning: Empty ROI at ({x1},{y1},{x2},{y2}), skipping confidence update")
-                
-        print("Confidence score updates completed")
-        
-    except Exception as e:
-        print(f"Error updating confidence scores: {e}")
-        import traceback
-        traceback.print_exc()
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    area_box1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area_box2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = area_box1 + area_box2 - inter_area
+    return inter_area / union_area if union_area > 0 else 0
 
-def save_detections_to_db(input_image, bounding_boxes, project_id):
-    """Save the detection results to the database."""
-    try:
-        # Create a database connector
-        from backend.services.LabelDatabaseConnector import MYSQLLabelDatabaseConnector
-        db_connector = MYSQLLabelDatabaseConnector()
-        
-        # Push the input image to get an image ID
-        image_id = db_connector.push_image(input_image, project_id)
-        print(f"Created image entry with ID: {image_id}")
-        
-        # If no image_id was returned, return None
-        if not image_id:
-            print("Error: Failed to save image to database")
-            return None
-        
-        # If bounding_boxes is None or empty, just return the image_id
-        if bounding_boxes is None or len(bounding_boxes) == 0:
-            print("No bounding boxes to save")
-            return image_id
-        
-        # Save each bounding box as a label
-        for box in bounding_boxes:
-            # Create a label object
-            label = {
-                "image_id": image_id,
-                "x1": float(box['x1']),
-                "y1": float(box['y1']),
-                "x2": float(box['x2']),
-                "y2": float(box['y2']),
-                "confidence": 1.0  # Default confidence score
-            }
-            
-            # Push the label to the database
-            db_connector.push_label(label)
-        
-        return image_id
-        
-    except Exception as e:
-        print(f"Error during save_detections_to_db: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+def non_max_suppression(detections: list, iou_threshold: float = 0.3) -> list:
+    """
+    Apply non-maximum suppression to reduce overlapping detections.
+    Each detection is a tuple: (x_min, y_min, x_max, y_max, confidence).
+    """
+    if not detections:
+        return []
+    # Sort detections by descending confidence
+    detections = sorted(detections, key=lambda x: x[4], reverse=True)
+    final_detections = []
+    while detections:
+        best = detections.pop(0)
+        final_detections.append(best)
+        detections = [det for det in detections if compute_iou(best, det) < iou_threshold]
+    return final_detections
 
-def detector(model_fname, in_fname, out_fname=None):
-    """Perform a sliding window detector on an image."""
-    if out_fname is None:
-        out_fname = os.path.splitext(in_fname)[0] + '_detection.png'
+def sliding_window_detection_multiscale(arr: np.ndarray, scales: list = [1.0, 0.8, 0.6, 0.4],
+                                          step: int = 1, win: int = 20, threshold: float = 0.5) -> list:
+    """
+    Run sliding window detection over multiple scales.
+    Returns a list of detections: each a tuple (x_min, y_min, x_max, y_max, confidence).
+    """
+    detections = []
+    original_height, original_width, _ = arr.shape
+    print("Starting multi-scale sliding window detection...")
+    for scale in scales:
+        # Resize the image for the current scale
+        new_width = int(original_width * scale)
+        new_height = int(original_height * scale)
+        scaled_image = np.array(Image.fromarray(arr).resize((new_width, new_height), Image.ANTIALIAS))
+        print(f"Processing scale {scale:.2f} with size ({new_width}, {new_height})...")
+        for i in range(0, new_height - win, step):
+            for j in range(0, new_width - win, step):
+                chip = scaled_image[i:i+win, j:j+win, :]
+                chip_normalized = chip / 255.0
+                prediction = model.predict(chip_normalized[np.newaxis, ...])[0]
+                confidence = prediction[1]  # Assuming [prob_background, prob_airplane]
+                if confidence >= threshold:
+                    # Map detection coordinates back to the original image
+                    x_min = int(j / scale)
+                    y_min = int(i / scale)
+                    x_max = int((j + win) / scale)
+                    y_max = int((i + win) / scale)
+                    detections.append((x_min, y_min, x_max, y_max, confidence))
+    print(f"Multi-scale detection found {len(detections)} raw detections.")
+    return detections
 
-    # Load model and input image
-    load_model(model_fname)
-    arr = preprocess_image(in_fname)
-    output = np.copy(arr)
+def draw_bounding_boxes_on_image(arr: np.ndarray, detections: list,
+                                 color: tuple = (0, 255, 0), thickness: int = 3) -> np.ndarray:
+    """
+    Draw all bounding boxes from detections on the image.
+    Each detection is a tuple (x_min, y_min, x_max, y_max, confidence).
+    """
+    im = Image.fromarray(arr)
+    draw = ImageDraw.Draw(im)
+    for det in detections:
+        x_min, y_min, x_max, y_max, confidence = det
+        for t in range(thickness):
+            draw.rectangle([x_min + t, y_min + t, x_max - t, y_max - t], outline=color)
+    return np.array(im)
 
-    # Perform sliding window detection
-    detections, confidences = sliding_window_detection(arr)
-
-    # Draw bounding boxes and get bounding box data
-    output, bounding_boxes = draw_bounding_boxes(output, detections, confidences, win=20)
-
-    # Save the processed output image
-    save_output_image(output, out_fname)
-    
-    # Print bounding box data
-    print("\nDetected Bounding Boxes:")
-    print("-" * 50)
-    for i, box in enumerate(bounding_boxes, 1):
-        print(f"Box {i}:")
-        print(f"  Coordinates: ({box['x1']}, {box['y1']}) to ({box['x2']}, {box['y2']})")
-        print(f"  Confidence: {box['confidence']:.3f}")
-        print("-" * 50)
-    print(f"\nTotal detections: {len(bounding_boxes)}")
-    
-    # Save detections to database using the input image path
-    project_id = 5  # Use the project ID from test_upload.py
-    image_id = save_detections_to_db(in_fname, bounding_boxes, project_id)
-    
-    # Update confidence scores
-    if image_id:
-        update_confidence_scores(np.array(Image.open(in_fname)), bounding_boxes, image_id)
-    
-    print("Detection script completed.")
+def push_detections_as_labels(detections: list, db_image: DBImage, class_name: str, label_db) -> None:
+    """
+    For each detection, create a new Label with a unique LabelID and push it to the DB.
+    """
+    for (x_min, y_min, x_max, y_max, confidence) in detections:
+        new_label = Label(
+            LabelID=str(uuid.uuid4()),
+            LabellerID=0,              # Use an appropriate LabellerID that exists in your DB
+            ImageID=1,                 # Ensure this ImageID exists in your Images table
+            Class=class_name,
+            top_left_x=x_min,
+            top_left_y=y_min,
+            bot_right_x=x_max,
+            bot_right_y=y_max,
+            offset_x=300,              # Adjust as needed
+            offset_y=300,              # Adjust as needed
+            creation_time=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            origImageID=db_image.ImageID
+        )
+        try:
+            label_db.push_label(new_label)
+            print(f"Label pushed to DB with LabelID={new_label.LabelID}.")
+        except Exception as e:
+            print("Error pushing label:", e)
 
 def main():
-    """Run the airplane detector on an input image."""
+    # Prompt for project ID, class, and model filename
+    project_id = input("Enter project ID to process: ").strip()
+    class_name = input("Enter class to extract (e.g., 'plane'): ").strip()
     
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Run object detection on an image.')
-    parser.add_argument('input_image', type=str, help='Path to input image')
-    parser.add_argument('--model', type=str, default=DEFAULT_MODEL_PATH, help='Path to model file')
-    parser.add_argument('--output', type=str, default=None, help='Path to output image')
-    parser.add_argument('--project_id', type=int, default=5, help='Project ID for database')
+    # Initialize DB connectors and services
+    project_db = MYSQLProjectDatabaseConnector()
+    label_db = MYSQLLabelDatabaseConnector()
+    labeller_db = MYSQLLabellerDatabaseConnector()
+    imageobject_db = MYSQLImageObjectDatabaseConnector()
+    icm_db = MYSQLImageClassMeasureDatabaseConnector()
+
+    object_service = ObjectExtractionService(icm_db, labeller_db)
+    manager = ObjectExtractionManager(project_db, label_db, labeller_db, imageobject_db, object_service)
     
-    # Check if we're getting multiple positional arguments (old format)
-    if len(sys.argv) > 2 and not sys.argv[2].startswith('--'):
-        # Handle old format: script.py model_path input_image [output_image]
-        model_path = sys.argv[1]
-        input_image = sys.argv[2]
-        output_path = sys.argv[3] if len(sys.argv) > 3 else None
-        project_id = 5  # Default project ID
-    else:
-        # New format with named arguments
-        args = parser.parse_args()
-        input_image = args.input_image
-        model_path = args.model
-        output_path = args.output
-        project_id = args.project_id
-    
-    print(f"Loading model from {model_path}...")
-    print(f"Reading input image from {input_image}...")
-    
-    # Run the detector
-    bounding_boxes = detector(model_path, input_image, output_path)
-    
-    # Save detections to database
-    image_id = save_detections_to_db(input_image, bounding_boxes, project_id)
-    
-    # If we got a valid image_id, update confidence scores
-    if image_id:
-        # Load the image as numpy array for update_confidence_scores
-        image_array = np.array(Image.open(input_image))
-        update_confidence_scores(image_array, bounding_boxes, image_id)
-    
-    return 0
+    # Retrieve the project and select the first image
+    projects = project_db.get_projects(f"SELECT * FROM my_image_db.Projects WHERE ProjectID = {project_id};")
+    if not projects:
+        print(f"No project found with ID {project_id}")
+        return
+    project = projects[0]
+    if not project.images:
+        print("No images in the project.")
+        return
+    db_image = project.images[0]
+    print(f"Processing image with ImageID: {db_image.ImageID}")
+
+    # Convert the DB image to a numpy array
+    arr = preprocess_image_from_db(db_image)
+
+    # Run multi-scale sliding window detection on the image
+    raw_detections = sliding_window_detection_multiscale(arr, scales=[1.0, 0.8, 0.6, 0.4],
+                                                         step=10, win=20, threshold=0.5)
+    # Apply Non-Maximum Suppression to filter overlapping detections
+    final_detections = non_max_suppression(raw_detections, iou_threshold=0.3)
+    print(f"After NMS, {len(final_detections)} detections remain.")
+
+    # Draw all final detections on the image
+    arr_with_boxes = draw_bounding_boxes_on_image(arr, final_detections, color=(0, 255, 0), thickness=3)
+    out_fname = f"extracted_{db_image.ImageID}.png"
+    Image.fromarray(arr_with_boxes).save(out_fname)
+    print(f"Output image with bounding boxes saved as {out_fname}.")
+
+    # Push each detection as a new label entry in the DB
+    push_detections_as_labels(final_detections, db_image, class_name, label_db)
+
+    print("Object extraction completed.")
 
 if __name__ == "__main__":
+    model_fname = input("Enter model filename: ").strip()
+    load_model(model_fname)
     main()
